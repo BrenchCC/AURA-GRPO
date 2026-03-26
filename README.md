@@ -1,115 +1,89 @@
-# SB-GRPO — Subjective Bias GRPO
+# AURA-GRPO: Adaptive Unified Reward Alignment GRPO
 
 ## 1. Background
 ```mermaid
 flowchart TB
 
-%% ================= 训练链路 =================
-subgraph training["训练链路"]
-    doubao([MLLM = Doubao])
+subgraph online["在线生产闭环"]
+    input["任务输入<br/>视频 / 图像 / 文本背景"]
+    teacher["Teacher / Reference Generator<br/>Gemini"]
+    output["线上生成结果"]
+    platform["产品平台 / 用户侧"]
+    signal["行为反馈 / 高质量样本"]
+
+    input --> teacher --> output --> platform --> signal
 end
 
+subgraph training["AURA-GRPO 训练闭环"]
+    seed["Seed / Policy Model"]
+    sft["SFT Warmup"]
+    aura["AURA-GRPO"]
 
-%% ================= 生产链路 =================
-subgraph production["生产链路"]
-
-    input["待剪辑视频<br/>+<br/>背景信息"]
-
-    service["AI素材生成服务<br/>(MLLM = Gemini)"]
-
-    material["AI素材"]
-
-    toutiao["业务平台"]
-
-    feedback["VV / 点赞 / 收藏 ..."]
-
-    high_quality["优质AI素材"]
-
-    input --> service
-    service --> material
-    material --> toutiao
-    toutiao --> feedback
-    feedback --> high_quality
-
+    seed --> sft --> aura
 end
 
-
-%% ================= 模型替换 =================
-doubao -. 替换 .-> service
-
-
-%% ================= Post Training 闭环 =================
-high_quality -. Post Training .-> doubao
+signal -. data curation .-> sft
+teacher -. reference outputs .-> aura
+aura -. update policy .-> seed
+aura -. replace online model .-> teacher
 ```
 
-- 基于Gemini数据飞轮（解说词生成、解说词&镜头匹配），我们生产了许多优质的AI素材
-- 我们回捞、处理线上的数据，以进行seed模型微调，用于降低token成本且提升生产的AI素材性能
-- 训练范式上，采用的是 SFT + RL（GRPO）
+- 我们从线上生产链路中回捞高质量样本与行为反馈，形成可持续的数据飞轮。
+- 训练侧先进行 `SFT warmup`，再进入 `AURA-GRPO`，以获得更稳定的主观任务优化信号。
+- 该框架不绑定具体业务场景，本质上是一个面向主观生成任务的通用 GRPO 后训练范式。
 
-> 1. seed-1.6以及seed-1.8的base model在解说词生成性能上与gemini-2.5-pro存在一定性能上的gap，所以会先进行SFT
-> 2. 同时观察&人工评测后发现，Gemini生成的解说词同样存在不足，希望可以利用RL的方式进一步提升性能，超越Gemini-2.5-pro的解说词生成效果
+> 1. seed-1.6 以及 seed-1.8 的 base model 在解说词生成性能上与 Gemini-2.5-Pro 存在一定 gap，因此需要先进行 SFT。
+> 2. 同时，观察与人工评测发现 Gemini 生成的解说词同样存在不足，希望利用 RL 进一步提升性能，尽量超越 Gemini-2.5-Pro 的解说词生成效果。
 
-## 2. GRPO + LLM-as-judge 
+## 2. AURA-GRPO: GRPO + LLM-as-Judge + Unified Reward
 ```mermaid
 flowchart LR
 
-%% ===== Inputs =====
-scenes["scenes"]
-background["background infos"]
-sys_prompt["sys_prompt"]
+subgraph input["输入"]
+    query["Query / Task"]
+    context["Context / Background"]
+    prompt["System Prompt"]
+end
 
-%% ===== Generation =====
-seed["Seed-Model(Doubao Series)"]
-rollout["rollout_i<br/>generated texts / json -> texts and labels"]
+subgraph policy["策略生成"]
+    model["Policy Model"]
+    rollout["G Rollouts"]
+end
 
-%% ===== Judge =====
-judge["Judge"]
-score["打分结果<br/>剧情一致性 / 解说词吸引力 / 文本流畅度"]
+subgraph reward["统一奖励建模"]
+    judge["LLM Judge"]
+    pairwise["Pairwise Preference"]
+    format_reward["Format Reward"]
+    unified["Unified Reward"]
+    advantage["GRPO Advantage"]
+end
 
-%% ===== RL =====
-format_reward["format_reward"]
-reward["reward"]
-advantage["Advantage"]
-
-%% ===== Connections =====
-
-scenes --> seed
-background --> seed
-sys_prompt --> seed
-
-seed --> rollout
-
+query --> model
+context --> model
+prompt --> model
+model --> rollout
 rollout --> judge
-scenes -. reference .-> judge
-
-judge --> score
-judge --> reward
-
 rollout --> format_reward
-format_reward --> reward
-
-reward --> advantage
-advantage --> seed
+judge --> pairwise --> unified
+format_reward --> unified
+unified --> advantage --> model
+context -. reference evidence .-> judge
 ```
 
-- 将 GRPO 与 LLM-as-Judge 结合的核心motivation在于：**突破可验证任务的限制**——相对于可验证/有明确答案的判别式任务，开放式生成任务（如解说词生成、小说生成），无法定义确定性的正确答案，需要更灵活的奖励信号。
+- 将 GRPO 与 LLM-as-Judge 结合的核心 motivation 在于：**突破可验证任务的限制**。相对于可验证或有明确答案的判别式任务，开放式生成任务（如解说词生成、小说生成）无法定义确定性的正确答案，因此需要更灵活的奖励信号。
 
 ```text
 训练数据 {q_1, ..., q_N}
-        │
-        ▼
-策略模型 π_θ ──采样G个输出──▶ {o_1, ..., o_G}
-        │
-        ▼
+    ↓
+策略模型 π_θ 采样 G 个输出 {o_1, ..., o_G}
+    ↓
 LLM-as-Judge 评估模块
-  ├─ 多维度评估
-  └─ r_i = Judge(q, o_i)
-        │
-        ▼
+  - 多维度打分
+  - r_i = Judge(q, o_i)
+    ↓
 GRPO 优势计算: A_i = (r_i - mean) / std
-        │
-        ▼
-策略梯度更新 + KL惩罚
+    ↓
+策略梯度更新 + KL 惩罚
 
 ```
 
@@ -226,8 +200,8 @@ judge_prompt = """你是一个用于自动评估“短剧解说词”质量的 *
 接下来你将接受用户的输入，包括视频背景信息，视频帧信息，以及一段解说文本输出列表，请按照上述要求完成你的评判和打分。"""
 ```
 
-## 3.  🧛Reward Hacking Issues
-- **output-example**：
+## 3. Reward Hacking Issues
+- **Output examples:**
 ```text
 [\n  {\"text\": \"教父竟在街头卖瓜！\", \"label\": \"解说词\"},\n  {\"text\": \"未婚妻突然找上门！\", \"label\": \"解说词\"},\n  {\"text\": \"地痞挑衅，他当场暴怒！\", \"label\": \"解说词\"},\n  {\"text\": \"下一秒竟动手打人！\", \"label\": \"解说词\"},\n  {\"text\": \"两人街头深情相拥。\", \"label\": \"解说词\"},\n  {\"text\": \"十万亩地的考验突然降临！\", \"label\": \"解说词\"},\n  {\"text\": \"他竟扬言三小时种完！\", \"label\": \"解说词\"},\n  {\"text\": \"所有人都笑他疯了。\", \"label\": \"解说词\"},\n  {\"text\": \"下一幕，十万战神即将出动\", \"label\": \"解说词\"}\n]
 
@@ -237,14 +211,14 @@ judge_prompt = """你是一个用于自动评估“短剧解说词”质量的 *
 [\n  {\"text\": \"金牌经纪人时莹，突然摔倒了！\", \"label\": \"解说词\"},\n  {\"text\": \"下一秒更离谱，她竟然穿越了！\", \"label\": \"解说词\"},\n  {\"text\": \"变成了镇国公府的卢夫人\", \"label\": \"解说词\"},\n  {\"text\": \"还得知家族即将满门抄斩\", \"label\": \"解说词\"},\n  {\"text\": \"只有改变原主命运，才能活下去\", \"label\": \"解说词\"},\n  {\"text\": \"就在这时，小太子突然中毒\", \"label\": \"解说词\"},\n  {\"text\": \"卢夫人竟然发现，是桂花过敏\", \"label\": \"解说词\"},\n  {\"text\": \"她决定入宫，拯救太子和家族\", \"label\": \"解说词\"},\n  {\"text\": \"一场惊心动魄的逆转，才刚刚开始\", \"label\": \"解说词\"}\n]
 ```
 
-* 具体表现形式：
-    - 格式黑客：模型学会使用特定格式（Markdown 列表、代码块等）获取高分，内容质量一般
-    - 风格黑客：模型学会使用评判者偏好的写作风格和用词
-    - 长度黑客：生成不必要的冗长回答
+- 具体表现形式：
+  - 格式黑客：模型学会使用特定格式（Markdown 列表、代码块等）获取高分，但内容质量一般。
+  - 风格黑客：模型学会迎合评判者偏好的写作风格和用词。
+  - 长度黑客：生成不必要的冗长回答。
 
-* 出现原因:
-  - 将模型评价指标当作优化目标：LLM-Judge 评分与真实质量只是不完全相关，过度优化会偏离真实目标
-  - 优势偏差: 小差异被过度放大，驱使模型过度优化以获取微小收益
+- 出现原因：
+  - 将模型评价指标当作优化目标：LLM-Judge 评分与真实质量并不完全等价，过度优化会偏离真实目标。
+  - 优势偏差：小差异被过度放大，驱使模型为获取微小收益而过度优化。
 
 > Judge Rewards: [0.9167, 0.9089, 0.8934, 0.8848, 0.8894, 0.9083,  0.9123, 0.9064]
 > $$u = 0.902525$$
@@ -253,12 +227,12 @@ judge_prompt = """你是一个用于自动评估“短剧解说词”质量的 *
 > max_eward_diff = 0.0319.     max_advantage_diff = 2.499
 > 
 
-- 缓解策略： KL 散度约束、早停机制、奖励模型集成、定期更新评判器。
+- 缓解策略：KL 散度约束、早停机制、奖励模型集成、定期更新评判器。
 
-## 4.Related Work：GRPO for objective problems
-GRPO 最初在数学/代码等可验证任务上取得突破（DeepSeek-R1），但将其推广到开放式主观生成任务——如创意写作、视频解说、图像描述等——是当前研究的前沿方向。核心挑战在于：这些任务没有唯一正确答案，奖励信号天然模糊且主观。以下按任务类型梳理代表性工作。
+## 4. Related Work: GRPO Beyond Objective Tasks
+GRPO 最初在数学、代码等可验证任务上取得突破（DeepSeek-R1），但将其推广到开放式主观生成任务，如创意写作、视频解说、图像描述等，是当前研究的前沿方向。核心挑战在于：这些任务没有唯一正确答案，奖励信号天然模糊且主观。以下按任务类型梳理代表性工作。
 
-### 4.1  Video/image Captioning 
+### 4.1 Video / Image Captioning
 - **[VideoCap-R1](https://arxiv.org/abs/2506.01725)** 是首个系统性地将 GRPO 应用于视频多模态大模型（Video MLLM）的工作。模型先在 <think> 标签内进行结构化思考（分析视频主体、属性与动作），再生成完整描述，配合双奖励机制：LLM-free Think Scorer 评估思考质量 + LLM-assisted Caption Scorer 评估输出质量。仅用 1.5K 训练样本，在 DREAM-1K (+4.4 event F1)、VDC (+4.2 Acc)、CAREBENCH (+3.1 action F1) 上均显著超越 SFT 对照组
 
     - a. 从 ground truth caption 中提取事件列表 
@@ -284,34 +258,32 @@ GRPO 最初在数学/代码等可验证任务上取得突破（DeepSeek-R1），
         2. 其余每个回复与 pivot 组成 pair，由 GenRM 做 pairwise 判断
         3. 优于 pivot → r=+1，劣于 pivot → r=−1，pivot 本身 → r=0
 
+## 5. AURA-GRPO: Adaptive Unified Reward Alignment GRPO
+### 5.1 Problems and Motivation
 
-## 5. SP-GRPO: Subjective Preference Guided Group Relative Policy Optimization
-### 5.1 Problems/Motivation
-
-1. 使用 GRPO 进行训练时，利用 LLM_as_Judge 得到 point score reward时，特别容易发生reward hacking现象，此时需要定义全面、大量的format reward进行额外的约束
-2. 对于偏主观任务（漂亮与否、写邮件），我们通过无法用一个确切的分数进行衡量。但如果样本是一个 pair 对，我们却很容易看出来哪一个好一些
-3. 不同的主观任务下，评测 prompt（rubric）都不相同，且需要自定义。若存在偏差，最后可能也会存在hacking现象
-4. 主观/生成任务 对应的 Format reward 难定义
+1. 使用 GRPO 训练时，如果直接使用 `LLM-as-Judge` 产生 point-wise reward，极易出现 reward hacking，因此往往需要大量额外的 format reward 约束。
+2. 对于偏主观任务（如解说词、美观度、邮件写作），很难给出绝对分数；但若把样本组成 pair，我们通常能更稳定地判断谁更好。
+3. 不同主观任务下，评测 prompt（rubric）差异很大，且需要高度定制；一旦 prompt 本身存在偏差，最终也可能被模型利用。
+4. 对主观/生成任务而言，Format reward 往往比客观任务更难定义，也更容易被 hack。
 
 ![alt text](sources/5.png)
 
 ### 5.2 Judge Prompt 自动优化（Automatic prompt optimization）
 LLM-as-Judge 的评分质量直接决定了奖励信号的可靠性。然而，手工编写的 Judge Prompt 存在一个主要问题：
-- 维度盲区：人工设定的评分维度（如"情感表达"、"流畅性"）可能遗漏实际训练训练中暴露出来的关键质量差异
+- 维度盲区：人工设定的评分维度（如“情感表达”“流畅性”）可能遗漏实际训练中暴露出来的关键质量差异。
 ```text
-Compare_samples ──→ Judge model ──→ reason ──→ Refine model
-                       ↑(当前 prompt)   (评判理由)       │
-                       │                               │
-                        ─── 更新后的 Judge Prompt ←──┘
+Compare samples → Judge model → reason → Refine model
+                     ↑ current prompt     │
+                     └──── updated Judge prompt ────┘
 ```                        
-具体生成步骤
-  1. 收集/构造一些compare samples (A > B or B > A)
-  2. 简单写一个judge prompt
-  3. 使用judge model对输入的compare samples进行分析、判别，输出reason与judeg_result
-  4. 利用reason以及refine agent优化当前 judge prompt
-  5. 迭代上面步骤 c -d (~16 iters)
+具体生成步骤：
+1. 收集或构造一批 compare samples（A > B 或 B > A）。
+2. 编写一个初始 judge prompt。
+3. 使用 judge model 对 compare samples 进行分析和判别，输出 reason 与 judge result。
+4. 利用 reason 和 refine agent 优化当前 judge prompt。
+5. 迭代上述步骤约 16 轮。
 
-### 5.3 Win_rate Reward
+### 5.3 Win-Rate Reward
 #### 5.3.1 对比拓扑设计
 对于每个 query，策略模型 $\pi_{\theta}$ 生成 $G=8$ 个 rollout ${o_1,…,o_8}$，同时持有一个 Gemini 生成的参考解说词 $o_{ref}$。我们构造 20 组 pairwise 比较，分为两类：
 | 比较类型             | 对数 | 具体配对                                                                 | 目的                         |
@@ -335,32 +307,32 @@ $$\text{comps}_i = |\{比较 \mid o_i \text{ 参与}\}| = 4$$
 
 胜率（Win Rate）为： $$r_i^{\text{win}} = \frac{\text{wins}_i}{\text{comps}_i}$$
 
-* 为什么需要与Gemini比较
-    1. 引导模型往正确的方向进行优化，不会在纯自博弈中陷入自我强化的封闭循环。
-    2. 用于 format reward 计算
+* 为什么需要与 Gemini 比较
+    1. 引导模型往正确方向优化，避免在纯自博弈中陷入自我强化的封闭循环。
+    2. 同时可为 format reward 提供外部参考。
 * 为什么组内胜利权重更高？
-    1. rollout输出是在不断优化的，而Gemini的输出则不是，
-    2. 确保策略既不会 overfit 到模仿 Gemini 风格
+    1. Rollout 输出会随着训练持续变化，而 Gemini 输出相对固定。
+    2. 这样可以确保策略不会过度 overfit 到模仿 Gemini 风格。
 
-### 5.4  Format Reward
+### 5.4 Format Reward
 #### 5.4.1 乘性调制
-Format reward在主观/生成式GRPO训练中影响会比想象中大许多。实验中关于format的优化包括：
-1. 加入Format reward
-2. 增大在final reward中的占比
-3. 将Format reward设类似为“门控”的单元
+Format reward 在主观/生成式 GRPO 训练中的影响比想象中更大。实验中围绕 format 的优化包括：
+1. 显式加入 Format reward。
+2. 提高其在 final reward 中的影响。
+3. 将 Format reward 设计成近似“门控”的单元。
 
 最终 reward 函数定义如下：
 $$r_i = r_i^{\text{win}} \times r_i^{\text{fmt}}$$
-Win rate 衡量的是 内容质量，format reward 衡量的是 格式合规性。二者通过乘法组合。
+Win-rate reward 衡量内容质量，format reward 衡量格式合规性，二者通过乘法组合。
 乘性组合的关键性质：
 - 当 $r_i^{\text{fmt}} = 0$ 时，无论内容质量多高，$r_i = 0$（格式严重违规 → 一票否决）
 - 当 $r_i^{\text{fmt}} = 1$ 时，奖励完全由内容质量决定（格式完美 → 不干扰）
-- 当 $0 < r_i^{\text{fmt}} < 1d$ 时，奖励被平滑压缩
+- 当 $0 < r_i^{\text{fmt}} < 1$ 时，奖励被平滑压缩
 
 #### 5.4.2 格式奖励泛化
 既然 Gemini 预生成的参考解说词是 format 合规的，它本身就是一个隐式的 format 规范定义。可以利用 ref 作为 "活的 format 标准" 来自动判断 rollout 解说词的合规性，从而摆脱手工定义规则不断迭代的困境。
 
-Format reward 使用 高斯惩罚函数，以 Gemini 参考作为格式锚点：
+Format reward 使用高斯惩罚函数，并以 Gemini 参考作为格式锚点：
 $$r_i^{\text{fmt}} = \min\left(g\!\left(\frac{N_i^{\text{sent}}}{N_{\text{ref}}^{\text{sent}}}\right),\; g\!\left(\frac{\bar{L}_i}{\bar{L}_{\text{ref}}}\right),\; g\!\left(\frac{L_i^{\text{total}}}{L_{\text{ref}}^{\text{total}}}\right)\right)$$
 
 其中 $$g(x) = \exp\!\left(-\frac{(x-1)^2}{2\sigma^2}\right)$$ 为高斯函数：
@@ -376,27 +348,32 @@ $$r_i^{\text{fmt}} = \min\left(g\!\left(\frac{N_i^{\text{sent}}}{N_{\text{ref}}^
 
 ### 5.5 完整奖励信号流
 ```text
-                    ┌─────────────────────────────────────┐
-                    │  对于每个 rollout oᵢ:                │
-                    │                                      │
-  8 × (oᵢ vs ref)  │   wins_gemini  ──┐                   │
-  ─────────────────►│                  ├─► win_rate ──┐    │
-  12 × (oᵢ vs oⱼ)  │   wins_rollout ──┘     (连续值)  │    │
-  ─────────────────►│                               ×  ──► rᵢ
-                    │   句数比 ──┐                    │    │
-                    │   句长比 ──┼─► min ─► fmt_reward┘    │
-                    │   总长比 ──┘   (高斯)                 │
-                    └─────────────────────────────────────┘
+20 组 pairwise 比较
+  - 8 × (o_i vs ref)
+  - 12 × (o_i vs o_j)
+        ↓
+wins_gemini + wins_rollout
+        ↓
+win_rate reward
+
+Gemini 参考格式锚点
+  - 句数比
+  - 平均句长比
+  - 总长比
+        ↓
+Gaussian format reward
+        ↓
+final reward = win_rate × format reward
 ```
 
-6. 总结
-核心优势总结(vs RLCS)：
-- 1. 信号密度：SP-GRPO 的 20 次比较提供的信息量约为 RLCS 的 4-5 倍（4 次/rollout vs 1 次/rollout），使 GRPO 的优势估计 $$\hat{A}_i$$ 具有更低的方差和更高的区分度。
-- 2. 零训练成本的奖励系统：RLCS 需要先投入大量资源训练 GenRM（专业编剧标注 → CoT 蒸馏 → SFT → GRPO 两阶段），而 SP-GRPO 直接使用通用 LLM 作为 Judge，通过 prompt 工程 + 自动优化 达到可比的评判质量，部署门槛显著更低。
+## 6. 总结
+核心优势总结（vs. RLCS）：
+- 1. 信号密度：AURA-GRPO 的 20 次比较提供的信息量约为 RLCS 的 4-5 倍（4 次/rollout vs 1 次/rollout），使 GRPO 的优势估计 $$\hat{A}_i$$ 具有更低的方差和更高的区分度。
+- 2. 零训练成本的奖励系统：RLCS 需要先投入大量资源训练 GenRM（专业编剧标注 → CoT 蒸馏 → SFT → GRPO 两阶段），而本文方案直接使用通用 LLM 作为 Judge，通过 prompt 工程 + 自动优化达到可比的评判质量，部署门槛显著更低。
 - 3. 双锚点架构抗漂移：Gemini 参考提供了不随训练变化的外部质量锚点，避免了纯自博弈中"策略越练越偏但自我感觉越来越好"的风险；而 RLCS 的随机 pivot 完全来自当前策略，缺乏这种外部校准机制。
 - 4. 泛化的格式奖励机制：提出以 Gemini 参考解说词为"活的 format 标准"，通过高斯惩罚函数在句数比、平均句长比、总长比三个维度自动度量格式合规性，以乘法门控（而非加权求和）与 win rate reward 组合。这种设计（a）彻底消除了"牺牲格式换质量"的 exploit 路径；（b）无需为每个任务手工定义 format 规则，format 标准随 ref 自适应变化，解决了主观/生成式任务中 format reward 难定义、易被 hack 的核心痛点。
 
 思考：
 - 1. Gemini 参考的质量天花板：当前的 format reward 和 win rate reward 均以 Gemini 生成的参考解说词为锚点。如果 Gemini 参考本身存在系统性偏差（如特定题材下的风格单一化），策略模型的优化方向可能被这一偏差所约束。未来可考虑引入多源参考（不同模型或人工标注），或在训练中期用当前模型的最优输出动态更新 ref pool。
 - 2. Pairwise 比较的计算开销：20 次 pairwise 比较虽然提供了高密度信号，但也意味着每个 training step 需要 20 次 LLM-as-Judge 调用。优化方向：训练后期减少比较次数（如仅保留 vs Gemini + 少量组内比较）
-- 3. Judge prompt需要加入一些业务经验/规则：当前生产的解说词带有剧集中的完整人名，会带来阅读体验的丧失。后续的one-stage训练中，我们会考虑在judge prompt中手动加入关于人物代称的规则。
+- 3. Judge prompt 需要加入一些业务经验和规则：当前生产的解说词带有剧集中的完整人名，会损失部分阅读体验。后续 one-stage 训练中，我们会考虑在 judge prompt 中手动加入关于人物代称的规则。
