@@ -40,7 +40,7 @@ aura -. replace online model .-> teacher
 
 背景信息生成的目标不是复述完整视频，而是把短剧压缩成一份可供生成和评审复用的上下文：剧集发生了什么、主要人物是谁、关键画面证据在哪里。对解说词任务来说，这份背景承担两个作用：一是给生成模型提供剧情边界，二是给 Judge 提供可核验的事实依据，减少凭空补剧情的空间。
 
-整条链路可以拆成四段：抽帧、按场景组织帧、生成剧情概要、补充主要人物信息。
+整条链路可以拆成四段：离线抽帧、按场景组织帧、调用 LLM loop 生成剧情概要、并行调用 LLM loop 补充主要人物信息。
 
 ```mermaid
 flowchart TB
@@ -60,15 +60,68 @@ flowchart TB
     frame_demo --> role_context --> background
 ```
 
-### 2.1 抽帧策略
+### 2.1 LLM loop 整体流程
+
+背景生成的入口是 `generate_playlet_info(data)`。它先把 `frames_demo.json` 中的剧集按 `episode_rank` 截到前 15 集，再通过 `aggregate_by_scene` 将同一 `scene_index` 下的帧聚合起来，形成 `ChapterRank2Scenes`。之后剧情概要和人物识别并发执行：`Get_playlet_summary` 负责生成 `playlet_description`，`Get_playlet_characters` 负责生成 `playlet_role_list`。两个分支都不是一次性把所有原始帧塞给模型，而是先做面向任务的帧选择，再按 batch 调用视觉 LLM，最后解析 JSON 并落到统一背景结构。
+
+```mermaid
+flowchart TB
+    frames_input["frames_demo.json<br/>多集抽帧结果"]
+    limit["取前 15 集<br/>按 episode_rank 排序"]
+    group["aggregate_by_scene<br/>按 scene_index 聚合三帧"]
+    scenes["ChapterRank2Scenes<br/>chapter / scene / images"]
+
+    frames_input --> limit --> group --> scenes
+
+    subgraph summary_loop["剧情概要 LLM loop"]
+        summary_select["每个 scene 取中间帧<br/>降低输入量，保留事件主状态"]
+        summary_batch["累计到 batch<br/>total_frames &gt;= 500<br/>或 5 集<br/>或到 max_chapters"]
+        prev_context["附带最近 3 条历史章节概要<br/>维持跨集人物与因果连续性"]
+        chapter_llm["视觉 LLM<br/>输出章节 summary JSON 数组"]
+        parse_chapter["清理 markdown fence<br/>json.loads 校验"]
+        retry_chapter["失败重试<br/>最多 MAX_RETRIES"]
+        chapters_info["chapters_info<br/>逐集概要列表"]
+        full_llm["文本 LLM<br/>合并为 full_summary"]
+    end
+
+    subgraph role_loop["人物识别 LLM loop"]
+        role_select["按 scene 时长选帧<br/>&gt; 3s 取首尾帧<br/>&lt;= 3s 取中间帧"]
+        role_batch["累计到 batch<br/>total_frames &gt;= 500<br/>或 max_chapters"]
+        frame_token["为每帧注入<br/>chapter_rank + frame_index"]
+        role_llm["视觉 LLM<br/>识别最多 3 位主要人物"]
+        parse_role["解析 characters JSON<br/>回填 iconic frame 图片路径"]
+        retry_role["失败重试<br/>最多 MAX_RETRIES"]
+        role_info["characters<br/>name / role_title / iconic_frames"]
+    end
+
+    scenes --> summary_select --> summary_batch --> prev_context --> chapter_llm --> parse_chapter --> chapters_info --> full_llm
+    chapter_llm -. error .-> retry_chapter -. retry .-> chapter_llm
+    scenes --> role_select --> role_batch --> frame_token --> role_llm --> parse_role --> role_info
+    role_llm -. error .-> retry_role -. retry .-> role_llm
+
+    full_llm --> final["construct_playlet_info<br/>playlet_description + playlet_role_list"]
+    role_info --> final
+```
+
+这个 loop 里有三层约束。第一层是输入约束：每张图在进入 LLM 前会转成 base64，并通过 `smart_resize` 控制像素上限，避免单次请求被少量大图挤爆。第二层是 batch 约束：剧情概要分支最多积累 5 集或约 500 帧就发起一次请求，人物分支在达到 `max_chapters` 或约 500 帧时发起请求。第三层是输出约束：prompt 要求只返回 JSON；代码会去掉 Markdown code fence 这类包裹，再解析 JSON，失败则丢弃当前 batch 或进入重试。这种设计的核心不是让 LLM 写得更漂亮，而是把背景生成控制在「可批处理、可解析、可回溯」的工程边界内。
+
+剧情概要分支有一个小的记忆窗口：每次生成新 batch 的章节概要时，会把最近 `max_prev_summarie = 3` 条历史概要附加给 LLM。这样做是为了让第 4、5 集之后的总结知道前面人物关系和冲突因果，但又不把所有历史概要都塞回上下文，避免早期错误被过度放大。所有章节概要生成后，再调用一次文本 LLM，把 `chapters_info` 合并为不超过 800 字的 `full_summary`，重点保留主要人物关系、关键事件、冲突转折和结局走向。
+
+人物识别分支和剧情概要分支并行，但它的目标更窄：识别最多 3 位主要人物，并为每个人返回不超过 2 个标志帧。这里每张输入图前都会插入 `chapter_rank` 和 `frame_index` 文本标记，LLM 返回 iconic frame 后，代码再用 `Chapter2Idx2Path` 把这个临时索引映射回真实图片路径。也就是说，人物分支输出的不是抽象的「这个人很重要」，而是可以定位到具体集数和具体帧的证据。
+
+### 2.2 背景生成的帧选择策略
 
 抽帧发生在背景生成之前。每部短剧以 `album_id` 或 `playlet_id` 作为主键，最多取前 15 集进入背景构建。这个上限主要是成本和信息密度的折中：短剧的核心人物关系、世界观设定和主要矛盾通常在前几集集中出现，继续扩大集数会显著增加视觉输入量，但对「前期剧情背景」的边际收益不稳定。
 
 单集视频先使用 `scene_detect` 这类开源镜头切分工具划分 scene。每个 scene 再按时间三等分抽取三帧，分别覆盖 scene 的前段、中段和后段。以 `frames_demo.json` 第一集为例，`scene_index_1` 的时间区间是 `[0.0, 2.27]` 秒，对应抽到 `0.57`、`1.13`、`1.7` 秒三帧；`scene_index_2` 的时间区间是 `[2.27, 6.37]` 秒，对应抽到 `3.29`、`4.32`、`5.34` 秒三帧。这个采样方式比只取关键帧更稳，尤其适合短剧里「人物进场、冲突升级、表情反应」连续发生的场景。
 
-抽帧结果不直接等同于剧情理解。它只是把视频压成一组有时间戳和场景边界的视觉证据，后续概要生成和人物识别都基于这组证据展开。
+离线抽帧得到的是候选证据池，真正进入背景生成 LLM 时还会二次选择。剧情概要分支采用「每个 scene 取中间帧」策略，即 `images[len(images) // 2]`。原因是逐集概要更关心 scene 的主状态：人物是否同处一室、冲突对象是谁、道具或环境是否已经出现。中间帧通常比首帧更少受到转场影响，也比尾帧更少只留下反应结果，因此适合作为低成本的剧情代表帧。这个策略会牺牲一部分动作连续性，但能显著降低输入帧数，使多集 batch 和历史概要上下文可以一起进入模型。
 
-### 2.2 `frame_demo.json` 字段格式
+人物识别分支采用另一套策略：如果 `scene_duration > 3.0` 秒，就取该 scene 的首帧和尾帧；如果 `scene_duration <= 3.0` 秒，就只取中间帧。长 scene 往往包含人物进出、镜头反打或姿态变化，首尾帧更容易覆盖不同人物和正脸机会；短 scene 的信息窗口很窄，首尾差异不稳定，只取中间帧可以避免把转场、模糊表情或不完整构图送进模型。人物分支还会让 LLM 优先挑「人物清晰可见、正脸、无遮挡、带字幕或场景提示」的标志帧，所以帧选择不只是为了识别人物，也是在为后续可视证据绑定做准备。
+
+因此，背景生成里的帧选择是两级策略：第一级离线抽帧保证每个 scene 有前中后三个候选证据；第二级按任务目标过滤候选帧。剧情概要更偏向事件代表性，所以用中间帧；人物识别更偏向身份可辨识度，所以长 scene 用首尾帧增加覆盖面，短 scene 用中间帧保稳定。抽帧结果不直接等同于剧情理解，它只是把视频压成一组有时间戳和场景边界的视觉证据，后续概要生成和人物识别都基于这组证据展开。
+
+### 2.3 `frame_demo.json` 字段格式
 
 这里的 `frame_demo.json` 指抽帧后的剧集级索引文件；仓库中的示例文件名是 `frames_demo.json`，当前样例包含 13 集。顶层是剧集数组，每个元素对应一集。单集下的 `frames` 是该集所有 scene 的抽帧结果，通常同一个 `scene_index` 会出现 3 条记录。
 
@@ -90,21 +143,21 @@ flowchart TB
 
 这个字段设计保留了两类信息：一类是剧集身份信息，用于把多集内容重新按顺序组织；另一类是可追溯的视觉证据，用于回到原视频定位某个场景、某个时间点和某张图片。后续 Judge 判断 hallucination 时，真正依赖的就是这类可回溯信息。
 
-### 2.3 剧情背景生成
+### 2.4 剧情背景生成
 
-剧情背景生成先按 `episode_rank` 恢复剧集顺序，再按 `scene_index` 聚合同一场景下的三帧。每个 scene 的三帧提供了一个很小的时间窗口：前一帧看场景状态，中间帧看冲突或动作，后一帧看结果或反应。对短剧解说而言，这比随机抽帧更容易保住事件链。
+剧情背景生成先按 `episode_rank` 恢复剧集顺序，再按 `scene_index` 聚合同一场景下的三帧。每个 scene 的三帧提供了一个很小的时间窗口：前一帧看场景状态，中间帧看冲突或动作，后一帧看结果或反应。概要生成实际送入 LLM 的是每个 scene 的中间帧，相当于用一个稳定代表帧去近似该 scene 的主要事件状态。对短剧解说而言，这比随机抽帧更容易保住事件链，也比全量送三帧更省上下文。
 
 生成时先得到逐集概要，再把逐集概要合并成短剧前期背景。逐集概要解决「每一集发生了什么」，合并概要解决「这部剧到当前阶段讲到了哪里」。这里不追求文学化表达，而是保留人物关系、关键事件、冲突转折和结局走向。后续生成解说词时，模型可以基于这段背景判断哪些事件已经发生，哪些内容只能作为悬念处理。
 
 这个环节的风险在于摘要会传播错误。若某一集把人物身份或事件因果概括错，后面的全局背景会继续吸收这个错误。因此背景信息更适合作为可核验上下文，而不是不可质疑的事实源；高价值样本仍然需要抽样回看原始帧。
 
-### 2.4 人物背景生成
+### 2.5 人物背景生成
 
-人物背景和剧情概要使用同一批抽帧证据，但关注点不同。剧情概要关心事件推进，人物背景关心「谁是主要人物、身份是什么、有没有清晰的标志帧」。标志帧的作用不是展示素材，而是让后续流程能把人物描述和视觉证据绑定起来。
+人物背景和剧情概要使用同一批抽帧证据，但关注点不同。剧情概要关心事件推进，人物背景关心「谁是主要人物、身份是什么、有没有清晰的标志帧」。因此人物分支不会固定每个 scene 只取一个代表帧，而是根据 scene 时长决定覆盖范围：长 scene 取首尾帧，短 scene 取中间帧。标志帧的作用不是展示素材，而是让后续流程能把人物描述和视觉证据绑定起来。
 
 最终人物信息会整理为人物名、人物身份或关系、代表帧列表。短剧任务里这一步很有价值，因为人物身份经常承担叙事功能：总裁、少主、假千金、重生女主、赘婿、家族长辈等标签会直接影响解说词的措辞和冲突解释。没有人物背景时，模型更容易把「画面里的人」写成泛化角色，甚至把不同人物混在一起。
 
-### 2.5 最终背景结构
+### 2.6 最终背景结构
 
 背景生成完成后，会得到一份以短剧为粒度的结构化信息：
 
