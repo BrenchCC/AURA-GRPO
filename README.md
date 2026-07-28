@@ -156,6 +156,33 @@ flowchart TB
 | 逐集概要生成 | `system` prompt 说明输出 JSON 数组；`user.content` 中按章节插入「下面是第 N 集的视频帧」文本，并追加该集每个 scene 的中间帧 base64 图片；若已有历史概要，则额外追加最近 `max_prev_summarie = 3` 条章节概要。 | JSON 数组，每个元素包含 `chapter_rank` 和 `summary`，例如 `[{"chapter_rank": 1, "summary": "..."}, ...]`。 | 先去掉 Markdown code fence，再用 `json.loads` 解析；解析成功的 dict 追加到 `chapters_info`，解析失败则跳过当前 batch。 |
 | 前期剧情总结 | `system` prompt 要求只输出 JSON；`user.content` 中传入完整 `chapters_info`，并要求按剧情顺序总结主要人物关系、关键事件、冲突转折和结局走向。 | JSON 对象，格式为 `{"full_summary": "总结文本"}`，其中 `full_summary` 不超过 800 字。 | 用 `json.loads` 解析后读取 `full_summary`，作为最终 `playlet_description`。 |
 
+#### 剧情背景输出示例
+
+下面的代码块仅用于在 README 中展示返回格式；实际调用时，LLM 必须直接返回 JSON，不能附带 Markdown code fence、解释或其他文本。
+
+逐集概要的顶层必须是数组，并与输入章节的顺序和数量一一对应。每个元素只能包含整数类型的 `chapter_rank` 和字符串类型的 `summary`；`summary` 应为单行纯文本，建议控制在 20～50 个汉字，概括该集的核心事件、冲突或转折。
+
+```json
+[
+  {
+    "chapter_rank": 1,
+    "summary": "大秦集团寻找少主秦朗，楚月心因家族逼婚劝装傻的秦朗离开东城。"
+  },
+  {
+    "chapter_rank": 2,
+    "summary": "楚家逼秦朗签署离婚协议并安排楚月心订婚，陆鸿宇此时率大秦集团到场。"
+  }
+]
+```
+
+前期剧情总结的顶层必须是对象，且只使用 `full_summary` 承载总结文本。内容按剧情发展顺序组织，覆盖主要人物关系、关键事件、冲突与转折以及后续走向，总长度不超过 800 字。
+
+```json
+{
+  "full_summary": "秦朗是大秦集团寻找的少主，却以装傻身份与楚月心生活。楚家为攀附叶家，逼楚月心与秦朗离婚并改嫁叶少阳；楚月心担心秦朗受害，劝他拿钱离开东城。楚家筹备宴席并逼秦朗签署离婚协议时，大秦集团负责人陆鸿宇突然到场。秦朗身份即将曝光，楚家的逼婚计划与各方利益冲突由此升级。"
+}
+```
+
 逐集概要 LLM 的输入不是裸图片列表，而是「章节提示文本 + 图片序列 + 可选历史概要」的混合消息。章节提示文本负责告诉模型接下来属于哪一集；图片序列提供视觉证据；历史概要负责承接跨集关系。输出必须是严格 JSON 数组，因为后续全局总结不再回看原始图片，而是直接消费 `chapters_info`。如果逐集概要输出多余解释、Markdown 或非 JSON 内容，解析会失败，该 batch 的概要不会进入后续总结。
 
 全局总结 LLM 的输入已经从多模态变成纯文本，核心是完整的 `chapters_info`。它的任务不是重新判断画面，而是压缩和整理：去掉重复场景，保留人物关系、事件因果和主要冲突。最终输出的 `full_summary` 会被写入 `playlet_background.playlet_description`，成为后续解说词生成和 Judge 评估都会读取的剧情背景。
@@ -205,6 +232,39 @@ flowchart TB
 | `playlet_role_list.role`             | 人物名或可识别的人物称谓。               |
 | `playlet_role_list.role_description` | 人物身份、关系或叙事功能。               |
 | `playlet_role_list.role_img`         | 人物标志帧，保留集数、帧索引和图片路径。 |
+
+将剧情总结和人物识别结果组装后，最终背景信息的格式如下。`playlet_description` 直接使用剧情总结 LLM 返回的 `full_summary`，人物字段则由 `construct_playlet_info` 转换得到。
+
+```json
+{
+  "playlet_id": "123456789",
+  "playlet_description": "秦朗是大秦集团寻找的少主，却以装傻身份与楚月心生活。楚家为攀附叶家，逼楚月心与秦朗离婚并改嫁叶少阳；楚月心担心秦朗受害，劝他拿钱离开东城。楚家筹备宴席并逼秦朗签署离婚协议时，大秦集团负责人陆鸿宇突然到场。秦朗身份即将曝光，楚家的逼婚计划与各方利益冲突由此升级。",
+  "playlet_role_list": [
+    {
+      "role": "秦朗",
+      "role_description": "男主，大秦集团少主",
+      "role_img": [
+        {
+          "chapter_rank": 1,
+          "frame_idx": "2",
+          "image": "frames/chapter_1/frame_2.jpg"
+        }
+      ]
+    },
+    {
+      "role": "楚月心",
+      "role_description": "女主，秦朗的妻子",
+      "role_img": [
+        {
+          "chapter_rank": 1,
+          "frame_idx": "5",
+          "image": "frames/chapter_1/frame_5.jpg"
+        }
+      ]
+    }
+  ]
+}
+```
 
 这份背景不是最终对用户展示的文案，更像训练样本的上下文层。它把视频压缩成「剧情概要 + 人物表 + 标志帧证据」三类信息。后续无论是生成解说词，还是用 LLM-as-Judge 做剧情一致性评估，都可以沿着这份结构回到原始视觉证据，判断一句解说是否有依据。
 
@@ -516,9 +576,9 @@ Compare samples → Judge model → reason → Refine model
 
 该拓扑让每个 rollout 恰好参与 3 次组内对比 + 1 次 Gemini 对比 = 4 次比较，使信息量分布更均匀，也控制了 judge 调用成本。12 对组内比较覆盖
 
-$$
+```math
 \binom{8}{2}=28
-$$
+```
 
 种可能配对中的 43%，可以近似建立组内排序。
 
@@ -526,25 +586,25 @@ $$
 
 不同类型的比较胜利获得不同的权重：
 
-$$
+```math
 w_i = \begin{cases} \frac{1}{2}=0.5 & \text{if } o_i \text{ 赢了 Gemini 参考} \\ \frac{7}{6} \approx 1.167 & \text{if } o_i \text{ 赢了另一个 rollout} \end{cases}
-$$
+```
 
 对每个 rollout $o_i$，累计其加权胜场数和总参与比较数：
 
-$$
+```math
 \text{wins}_i = \sum_{\text{vs gemini}} w_{\text{gemini}} \cdot \mathbb{1}[o_i \text{ wins}] + \sum_{\text{vs rollout}} w_{\text{rollout}} \cdot \mathbb{1}[o_i \text{ wins}]
-$$
+```
 
-$$
+```math
 \text{comps}_i = |\{比较 \mid o_i \text{ 参与}\}| = 4
-$$
+```
 
 胜率（Win Rate）为：
 
-$$
+```math
 r_i^{\text{win}} = \frac{\text{wins}_i}{\text{comps}_i}
-$$
+```
 
 
 * 为什么需要与 Gemini 比较
@@ -566,16 +626,16 @@ Format reward 在主观/生成式 GRPO 训练中很容易主导优化方向。�
 
 最终 reward 函数定义如下：
 
-$$
+```math
 r_i = r_i^{\text{win}} \times r_i^{\text{fmt}}
-$$
+```
 
 Win-rate reward 衡量内容质量，format reward 衡量格式合规性，二者通过乘法组合。
 乘性组合有三个性质：
 
 - 当 $r_i^{\text{fmt}} = 0$ 时，无论内容质量多高，$r_i = 0$（格式严重违规 → 一票否决）
 - 当 $r_i^{\text{fmt}} = 1$ 时，奖励完全由内容质量决定（格式完美 → 不干扰）
-- 当 $0 < r_i^{\text{fmt}} < 1$ 时，奖励被平滑压缩
+- 当 $0 \lt r_i^{\text{fmt}} \lt 1$ 时，奖励被平滑压缩
 
 #### 6.4.2 格式奖励泛化
 
@@ -583,15 +643,15 @@ Gemini 预生成的参考解说词已经满足当前任务的 format 要求，�
 
 Format reward 使用高斯惩罚函数，并以 Gemini 参考作为格式锚点：
 
-$$
+```math
 r_i^{\text{fmt}} = \min\left(g\!\left(\frac{N_i^{\text{sent}}}{N_{\text{ref}}^{\text{sent}}}\right),\; g\!\left(\frac{\bar{L}_i}{\bar{L}_{\text{ref}}}\right),\; g\!\left(\frac{L_i^{\text{total}}}{L_{\text{ref}}^{\text{total}}}\right)\right)
-$$
+```
 
 其中
 
-$$
+```math
 g(x) = \exp\!\left(-\frac{(x-1)^2}{2\sigma^2}\right)
-$$
+```
 
 为高斯函数：
 ![alt text](assets/6.png)
