@@ -156,6 +156,61 @@ flowchart TB
 | 逐集概要生成 | `system` prompt 说明输出 JSON 数组；`user.content` 中按章节插入「下面是第 N 集的视频帧」文本，并追加该集每个 scene 的中间帧 base64 图片；若已有历史概要，则额外追加最近 `max_prev_summarie = 3` 条章节概要。 | JSON 数组，每个元素包含 `chapter_rank` 和 `summary`，例如 `[{"chapter_rank": 1, "summary": "..."}, ...]`。 | 先去掉 Markdown code fence，再用 `json.loads` 解析；解析成功的 dict 追加到 `chapters_info`，解析失败则跳过当前 batch。 |
 | 前期剧情总结 | `system` prompt 要求只输出 JSON；`user.content` 中传入完整 `chapters_info`，并要求按剧情顺序总结主要人物关系、关键事件、冲突转折和结局走向。 | JSON 对象，格式为 `{"full_summary": "总结文本"}`，其中 `full_summary` 不超过 800 字。 | 用 `json.loads` 解析后读取 `full_summary`，作为最终 `playlet_description`。 |
 
+#### 剧情概要 Prompt
+
+逐集概要调用使用一个视觉 LLM `system` prompt，并在 `user.content` 中按 batch 动态追加章节提示、图片和最近的历史概要。对应的 `system` prompt 如下：
+
+````text
+你是一个用于生成章节剧情概要的助手。
+
+输入变量：
+- chapter_frames：当前待生成概要的视频帧列表，每一章的 frames 输入前会标明对应的 chapter_rank。
+- chapters_info：用于参考的历史章节概要（如有）。
+
+你的任务：为 chapter_frames 中的每个章节生成一条单行、简洁、准确的剧情 summary，并严格只返回一个 JSON 数组。数组内对象按 chapter_frames 对应的 chapter_rank 顺序与数量一一对应。绝对禁止输出除 JSON 以外的任何文字、标记、注释或格式。
+
+生成规则：
+1. 顶层只能是数组，数组元素格式为：
+   [{"chapter_rank": 1, "summary": "单行纯文本概要"}]
+2. 每个对象必须且只能包含 chapter_rank（整数）和 summary（字符串）两个字段。
+3. summary 必须是单行纯文本，建议长度为 20–50 个汉字，概括该章的核心冲突、转折或主要事件。
+4. summary 不得包含换行符、Markdown 标记、代码块、时间戳、章节小标题、序号列表、脚本式对白、内心独白标注、注释或编辑指令。
+5. summary 中不得使用英文双引号；如有需要，改用中文引号或直接删除双引号。
+6. 可以参考 chapters_info，但不得直接复制历史原文的多行或格式化内容。
+7. 返回数组顺序必须与 chapter_frames 保持一致；若 chapter_frames 为空，返回 []。
+8. 如果无法生成合法概要，也必须返回 []，不要返回错误信息或其他非 JSON 文本。
+9. 输出首字符应为 [，末字符应为 ]，并且能够被标准 JSON 解析库解析。
+````
+
+代码随后为每个 batch 追加以下用户内容：
+
+````text
+下面是第 {chapter_rank} 集的视频帧：
+[该章节各 scene 的中间帧]
+
+以下是前面剧集的概要信息，以供参考：
+第{chapter_rank}章节概要：{summary}
+````
+
+其中历史概要只保留最近 `max_prev_summarie = 3` 条；图片以 `image_url` 的 base64 数据发送。逐集概要生成完成后，`chapters_info` 会被传入第二个文本 LLM。该调用的 prompt 为：
+
+````text
+system:
+你是一位擅长将长篇剧情浓缩为结构化概要的助手。你必须按照指定 JSON 结构输出，并严格遵守格式要求。不要有额外文字、解释或非 JSON 内容。
+
+user:
+以下是该短剧的章节剧情概要：
+{json.dumps(chapters_info, ensure_ascii=False, indent=2)}
+
+请根据这些章节概要，生成一个精炼且完整的前期剧情总结。
+要求：
+1. 输出必须是有效 JSON：{"full_summary": "总结文本"}
+2. full_summary 应逻辑清晰，按剧情发展顺序总结，不超过 800 字。
+3. 内容应涵盖主要人物关系、关键事件、冲突与转折、结局走向。
+4. 精炼描述，去掉重复或不重要的细节。
+5. 不要在 JSON 外输出任何内容，包括解释或附加文字。
+````
+
 #### 剧情背景输出示例
 
 下面的代码块仅用于在 README 中展示返回格式；实际调用时，LLM 必须直接返回 JSON，不能附带 Markdown code fence、解释或其他文本。
@@ -198,6 +253,45 @@ flowchart TB
 | 阶段 | LLM 输入 | LLM 输出 | 代码消费方式 |
 | ---- | -------- | -------- | ------------ |
 | 主要人物识别 | `system` prompt 要求识别最多 3 位主要人物；`user.content` 中按章节插入章节提示文本，并为每张候选帧插入 `chapter_rank + frame_index` 文本标记和图片。候选帧来自长 scene 首尾帧、短 scene 中间帧。 | JSON 对象，顶层字段为 `characters`；每个人物包含 `name`、`role_title`、`iconic_frames`，其中 `iconic_frames` 最多 2 条，每条包含 `chapter_rank` 和字符串形式的 `frame_idx`。 | 清理 Markdown code fence 后解析 JSON；读取 `characters`，再用 `chapter_rank` 和 `frame_idx` 查 `Chapter2Idx2Path`，给每个 iconic frame 回填真实 `image` 路径。 |
+
+#### 人物识别 Prompt
+
+人物识别使用视觉 LLM。`system` prompt 要求模型识别主要人物并返回可回溯的标志帧；`user.content` 按章节追加章节提示、`chapter_rank` 与临时 `frame_index`，再追加对应图片：
+
+````text
+你是角色识别与定位助手。任务：从下面提供的视频帧中识别出最多 3 位主要人物，并为每位人物返回不超过 2 个标志性帧（chapter_rank 与 frame_idx）。
+
+输出要求（严格）：仅返回一个有效的 JSON 对象，格式如下：
+{
+  "characters": [
+    {
+      "name": "主要人物名",
+      "role_title": "角色头衔或人物背景（简洁）",
+      "iconic_frames": [
+        {"chapter_rank": 7, "frame_idx": "2"},
+        {"chapter_rank": 8, "frame_idx": "35"}
+      ]
+    }
+  ]
+}
+
+约束：
+1. 每个 characters 元素必须包含 name、role_title、iconic_frames 三个字段。
+2. name 应使用剧中人名，例如“张旭东”“赵德柱”；配角若没有提及姓名，名字应带上相关主角的名字，例如“张旭东母亲”。
+3. 每个 iconic_frames 最多包含 2 条；frame_idx 必须为字符串。
+4. 只返回 JSON，不要有任何多余的说明、解释或文本。
+5. 选择标志性帧时，优先满足：人物清晰可见、正脸、无遮挡；若帧含有明显字幕或场景提示则更优。
+````
+
+每张图片之前会追加一条帧定位文本：
+
+````text
+下面是第 {chapter_rank} 集的视频帧：
+chapter_rank: {chapter_rank}, frame_index: {frame_index}
+[对应图片]
+````
+
+这里的 `frame_index` 是当前章节内重新编号的临时索引，不是原视频的 `frame_idx`。模型返回后，代码通过 `Chapter2Idx2Path[chapter_rank][frame_index]` 将标志帧映射回真实图片路径。
 
 人物 LLM 的输出示意如下：
 
